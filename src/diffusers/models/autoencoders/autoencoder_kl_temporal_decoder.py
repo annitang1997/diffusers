@@ -65,7 +65,7 @@ class TemporalDecoder(nn.Module):
             prev_output_channel = output_channel
 
         self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=32, eps=1e-6)
-
+ 
         self.conv_act = nn.SiLU()
         self.conv_out = torch.nn.Conv2d(
             in_channels=block_out_channels[0],
