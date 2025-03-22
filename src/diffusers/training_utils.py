@@ -24,8 +24,7 @@ from .utils import (
 if is_transformers_available():
     import transformers
 
-    # if transformers.integrations.deepspeed.is_deepspeed_zero3_enabled():
-    if transformers.deepspeed.is_deepspeed_zero3_enabled():
+    if transformers.integrations.deepspeed.is_deepspeed_zero3_enabled():
         import deepspeed
 
 if is_peft_available():
