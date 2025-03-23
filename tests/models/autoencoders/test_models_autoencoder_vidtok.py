@@ -51,7 +51,7 @@ class AutoencoderVidTokTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCas
         batch_size = 4
         num_frames = 17
         num_channels = 3
-        sizes = (64, 64)
+        sizes = (32, 32)
 
         image = floats_tensor((batch_size, num_channels, num_frames) + sizes).to(torch_device)
 
@@ -59,11 +59,11 @@ class AutoencoderVidTokTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCas
 
     @property
     def input_shape(self):
-        return (3, 17, 64, 64)
+        return (3, 17, 32, 32)
 
     @property
     def output_shape(self):
-        return (3, 17, 64, 64)
+        return (3, 17, 32, 32)
 
     def prepare_init_args_and_inputs_for_common(self):
         init_dict = self.get_autoencoder_vidtok_config()

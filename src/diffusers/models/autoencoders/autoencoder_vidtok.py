@@ -791,10 +791,10 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             The codebook size used only in discrete cases.
         is_causal (`bool`, defaults to `True`): 
             Whether it is a causal module.
-        sample_height (`int`, defaults to 256): 
-            Sample input height.
-        sample_width (`int`, defaults to 256): 
-            Sample input width.
+        # sample_height (`int`, defaults to 256): 
+        #     Sample input height.
+        # sample_width (`int`, defaults to 256): 
+        #     Sample input width.
     """
 
     _supports_gradient_checkpointing = True
@@ -814,8 +814,8 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         regularizer: str = "kl",
         codebook_size: int = 262144,
         is_causal: bool = True,
-        sample_height: int = 256,
-        sample_width: int = 256,
+        # sample_height: int = 256,
+        # sample_width: int = 256,
     ):
         super().__init__()
         self.is_causal = is_causal
@@ -850,16 +850,21 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         
         self.use_slicing = False
         self.use_tiling = False
+        
+        # Decode more latent frames at once
+        self.num_sample_frames_batch_size = 16
+        self.num_latent_frames_batch_size = self.num_sample_frames_batch_size // self.temporal_compression_ratio
 
         # We make the minimum height and width of sample for tiling half that of the generally supported
-        self.tile_sample_min_height = sample_height // 2
-        self.tile_sample_min_width = sample_width // 2
-        self.tile_latent_min_height = int(
-            self.tile_sample_min_height / (2 ** (len(self.config.ch_mult) - 1))
-        )
+        # self.tile_sample_min_height = sample_height // 2
+        # self.tile_sample_min_width = sample_width // 2
+        self.tile_sample_min_height = 256
+        self.tile_sample_min_width = 256
+        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** (len(self.config.ch_mult) - 1)))
         self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** (len(self.config.ch_mult) - 1)))
-        self.tile_overlap_factor_height = 1 / 8
-        self.tile_overlap_factor_width = 1 / 8
+        
+        self.tile_overlap_factor_height = 0.0  # 1 / 8
+        self.tile_overlap_factor_width = 0.0  # 1 / 8
     
     @staticmethod
     def pad_at_dim(t: torch.Tensor, pad: Tuple[int], dim: int = -1, pad_mode: str = "constant", value: float = 0.0) -> torch.Tensor:
@@ -903,9 +908,7 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.use_tiling = True
         self.tile_sample_min_height = tile_sample_min_height or self.tile_sample_min_height
         self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
-        self.tile_latent_min_height = int(
-            self.tile_sample_min_height / (2 ** (len(self.config.ch_mult) - 1))
-        )
+        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** (len(self.config.ch_mult) - 1)))
         self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** (len(self.config.ch_mult) - 1)))
         self.tile_overlap_factor_height = tile_overlap_factor_height or self.tile_overlap_factor_height
         self.tile_overlap_factor_width = tile_overlap_factor_width or self.tile_overlap_factor_width
@@ -932,9 +935,10 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.use_slicing = False
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        height, width = x.shape[-2:]
-
-        if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height):
+        num_frames, height, width = x.shape[-3:]
+        # print(width, height, self.tile_sample_min_width, self.tile_sample_min_height)
+        # exit()
+        if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height or num_frames > self.num_sample_frames_batch_size):
             return self.tiled_encode(x)
 
         return self.encoder(x)
@@ -1006,6 +1010,7 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             )
         return b
 
+    # TODO
     def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
         r"""Encode a batch of images using a tiled encoder.
 
@@ -1021,7 +1026,7 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         Returns:
             `torch.Tensor`: The latent representation of the encoded videos.
         """
-        height, width = x.shape[-2:]
+        num_frames, height, width = x.shape[-3:]
 
         overlap_height = int(self.tile_sample_min_height * (1 - self.tile_overlap_factor_height))
         overlap_width = int(self.tile_sample_min_width * (1 - self.tile_overlap_factor_width))
@@ -1029,6 +1034,10 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         blend_extent_width = int(self.tile_latent_min_width * self.tile_overlap_factor_width)
         row_limit_height = self.tile_latent_min_height - blend_extent_height
         row_limit_width = self.tile_latent_min_width - blend_extent_width
+        frame_batch_size = self.num_sample_frames_batch_size
+        
+        # print(overlap_height, overlap_width, blend_extent_height, row_limit_height, row_limit_width)    
+        # exit()
 
         # Split x into overlapping tiles and encode them separately.
         # The tiles have an overlap to avoid seams between tiles.
@@ -1036,9 +1045,25 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
-                tile = x[:, :, :, i : i + self.tile_sample_min_height, j : j + self.tile_sample_min_width]
-                tile = self.encoder(tile)
-                row.append(tile)
+                num_batches = max(num_frames // frame_batch_size, 1)
+                time = []
+                for k in range(num_batches):
+                    remaining_frames = num_frames % frame_batch_size
+                    start_frame = frame_batch_size * k + (0 if k == 0 else remaining_frames)
+                    end_frame = frame_batch_size * (k + 1) + remaining_frames
+                    tile = x[
+                        :,
+                        :,
+                        start_frame:end_frame,
+                        i : i + self.tile_sample_min_height,
+                        j : j + self.tile_sample_min_width,
+                    ]
+                    tile = self.encoder(tile)
+                    time.append(tile)
+                row.append(torch.cat(time, dim=2))
+                # tile = x[:, :, :, i : i + self.tile_sample_min_height, j : j + self.tile_sample_min_width]
+                # tile = self.encoder(tile)
+                # row.append(tile)
             rows.append(row)
 
         result_rows = []
@@ -1051,6 +1076,7 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     tile = self.blend_v(rows[i - 1][j], tile, blend_extent_height)
                 if j > 0:
                     tile = self.blend_h(row[j - 1], tile, blend_extent_width)
+                # print(i, j, tile[:, :, :, :row_limit_height, :row_limit_width].shape)
                 result_row.append(tile[:, :, :, :row_limit_height, :row_limit_width])
             result_rows.append(torch.cat(result_row, dim=4))
 
@@ -1067,7 +1093,7 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         Returns:
             `torch.Tensor`: Reconstructed batch of videos.
         """
-        height, width = z.shape[-2:]
+        num_frames, height, width = z.shape[-3:]
 
         overlap_height = int(self.tile_latent_min_height * (1 - self.tile_overlap_factor_height))
         overlap_width = int(self.tile_latent_min_width * (1 - self.tile_overlap_factor_width))
@@ -1075,6 +1101,10 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         blend_extent_width = int(self.tile_sample_min_width * self.tile_overlap_factor_width)
         row_limit_height = self.tile_sample_min_height - blend_extent_height
         row_limit_width = self.tile_sample_min_width - blend_extent_width
+        frame_batch_size = self.num_latent_frames_batch_size
+        
+        # print(height, overlap_height, blend_extent_height, row_limit_height)
+        # exit()
 
         # Split z into overlapping tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
@@ -1082,9 +1112,27 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
-                tile = z[:, :, :, i : i + self.tile_latent_min_height, j : j + self.tile_latent_min_width]
-                tile = self.decoder(tile)
-                row.append(tile)
+                num_batches = max(num_frames // frame_batch_size, 1)
+                time = []
+                for k in range(num_batches):
+                    remaining_frames = num_frames % frame_batch_size
+                    start_frame = frame_batch_size * k + (0 if k == 0 else remaining_frames)
+                    end_frame = frame_batch_size * (k + 1) + remaining_frames
+                    tile = z[
+                        :,
+                        :,
+                        start_frame:end_frame,
+                        i : i + self.tile_latent_min_height,
+                        j : j + self.tile_latent_min_width,
+                    ]
+                    tile = self.decoder(tile)
+                    time.append(tile)
+                    
+                # tile = z[:, :, :, i : i + self.tile_latent_min_height, j : j + self.tile_latent_min_width]
+                # tile = self.decoder(tile)
+                # row.append(tile)
+                row.append(torch.cat(time, dim=2))
+                
             rows.append(row)
 
         result_rows = []
