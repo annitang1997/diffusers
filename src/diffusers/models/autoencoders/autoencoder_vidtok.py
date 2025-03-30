@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, pack, unpack
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders.single_file_model import FromOriginalModelMixin
@@ -80,14 +80,30 @@ class VidTokCausalConv1d(nn.Module):
 
         self.pad_mode = pad_mode
         self.time_pad = dilation * (kernel_size - 1) + (1 - stride)
-        self.time_causal_padding = (self.time_pad, 0)
 
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, dilation=dilation, **kwargs)
+        
+        self.is_first_chunk = True
+        self.causal_cache = None
+        self.cache_offset = 0
 
     def forward(self, x):
         r"""The forward method of the `VidTokCausalConv1d` class."""
-        pad_mode = self.pad_mode if self.time_pad < x.shape[2] else "constant"
-        x = F.pad(x, self.time_causal_padding, mode=pad_mode)
+        if self.is_first_chunk:
+            first_frame_pad = x[:, :, :1].repeat(
+                (1, 1, self.time_pad)
+            )
+        else:
+            first_frame_pad = self.causal_cache
+            if self.time_pad != 0:
+                first_frame_pad = first_frame_pad[:, :, -self.time_pad:]
+            else:
+                first_frame_pad = first_frame_pad[:, :, 0:0]    
+        x = torch.concatenate((first_frame_pad, x), dim=2)
+        if self.cache_offset == 0:
+            self.causal_cache = x.clone()
+        else:
+            self.causal_cache = x[:,:,:-self.cache_offset].clone()
         return self.conv(x)
 
 
@@ -118,19 +134,22 @@ class VidTokCausalConv3d(nn.Module):
         self.pad_mode = pad_mode
         time_pad = dilation[0] * (time_kernel_size - 1) + (1 - stride[0])
         height_pad = dilation[1] * (height_kernel_size - 1) + (1 - stride[1])
-        width_pad = dilation[2] * (height_kernel_size - 1) + (1 - stride[2])
+        width_pad = dilation[2] * (width_kernel_size - 1) + (1 - stride[2])
 
         self.time_pad = time_pad
-        self.time_causal_padding = (
+        self.spatial_padding = (
             width_pad // 2,
             width_pad - width_pad // 2,
             height_pad // 2,
             height_pad - height_pad // 2,
-            time_pad,
+            0,
             0,
         )
-
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, dilation=dilation, **kwargs)
+        
+        self.is_first_chunk = True
+        self.causal_cache = None
+        self.cache_offset = 0
 
     @staticmethod
     def cast_tuple(t: Union[Tuple[int], int], length: int = 1) -> Tuple[int]:
@@ -139,8 +158,22 @@ class VidTokCausalConv3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""The forward method of the `VidTokCausalConv3d` class."""
-        pad_mode = self.pad_mode if self.time_pad < x.shape[2] else "constant"
-        x = F.pad(x, self.time_causal_padding, mode=pad_mode)
+        if self.is_first_chunk:
+            first_frame_pad = x[:, :, :1, :, :].repeat(
+                (1, 1, self.time_pad, 1, 1)
+            )
+        else:
+            first_frame_pad = self.causal_cache
+            if self.time_pad != 0:
+                first_frame_pad = first_frame_pad[:, :, -self.time_pad:]
+            else:
+                first_frame_pad = first_frame_pad[:, :, 0:0]
+        x = torch.concatenate((first_frame_pad, x), dim=2)
+        if self.cache_offset == 0:
+            self.causal_cache = x.clone()
+        else:
+            self.causal_cache = x[:,:,:-self.cache_offset].clone()
+        x = F.pad(x, self.spatial_padding, mode=self.pad_mode)
         return self.conv(x)
 
 
@@ -166,13 +199,21 @@ class VidTokDownsample3D(nn.Module):
             else nn.Conv3d(in_channels, out_channels, 3, stride=(2, 1, 1), padding=(0, 1, 1))
         )
         self.mix_factor = nn.Parameter(torch.Tensor([mix_factor]))
+        if self.is_causal:
+            self.is_first_chunk = True
+            self.causal_cache = None
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""The forward method of the `VidTokDownsample3D` class."""
         alpha = torch.sigmoid(self.mix_factor)
         if self.is_causal:
             pad = (0, 0, 0, 0, 1, 0)
-            x1 = self.avg_pool(F.pad(x, pad, mode="constant", value=0))
+            if self.is_first_chunk:
+                x_pad = torch.nn.functional.pad(x, pad, mode="replicate")
+            else:
+                x_pad = torch.concatenate((self.causal_cache, x), dim=2)
+            self.causal_cache = x_pad[:,:,-1:].clone()
+            x1 = self.avg_pool(x_pad)
         else:
             pad = (0, 0, 0, 0, 0, 1)
             x = F.pad(x, pad, mode="constant", value=0)
@@ -189,6 +230,7 @@ class VidTokUpsample3D(nn.Module):
         in_channels (`int`): Number of channels in the input tensor.
         out_channels (`int`): Number of channels in the output tensor.
         mix_factor (`float`, defaults to 2.0): The mixing factor of two inputs.
+        num_temp_upsample (`int`, defaults to 1): The number of temporal upsample ratio.
         is_causal (`bool`, defaults to `True`): Whether it is a causal module.
     """
 
@@ -197,20 +239,48 @@ class VidTokUpsample3D(nn.Module):
         in_channels: int,
         out_channels: int,
         mix_factor: float = 2.0,
+        num_temp_upsample: int = 1,
         is_causal: bool = True
     ):
         super().__init__()
         self.conv = VidTokCausalConv3d(in_channels, out_channels, 3, padding=0) if is_causal else nn.Conv3d(in_channels, out_channels, 3, padding=1)
         self.mix_factor = nn.Parameter(torch.Tensor([mix_factor]))
+        
+        self.is_causal = is_causal
+        if self.is_causal:
+            self.enable_cached = True
+            self.interpolation_mode = "trilinear" 
+            self.is_first_chunk = True
+            self.causal_cache = None
+            self.num_temp_upsample = num_temp_upsample
+        else:
+            self.enable_cached = False
+            self.interpolation_mode = "nearest"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""The forward method of the `VidTokUpsample3D` class."""
         alpha = torch.sigmoid(self.mix_factor)
-        xlst = [
-            F.interpolate(sx.unsqueeze(0).to(torch.float32), scale_factor=[2.0, 1.0, 1.0], mode="nearest").to(x.dtype)
-            for sx in x
-        ]
-        x = torch.cat(xlst, dim=0)
+        if not self.is_causal:
+            xlst = [
+                F.interpolate(sx.unsqueeze(0).to(torch.float32), scale_factor=[2.0, 1.0, 1.0], mode=self.interpolation_mode).to(x.dtype)
+                for sx in x
+            ]
+            x = torch.cat(xlst, dim=0)
+        else:
+            if not self.enable_cached:
+                x = F.interpolate(x.to(torch.float32), scale_factor=[2.0, 1.0, 1.0], mode=self.interpolation_mode).to(x.dtype)
+            elif not self.is_first_chunk:
+                x = torch.cat([self.causal_cache, x], dim=2)
+                self.causal_cache = x[:, :, -2*self.num_temp_upsample:-self.num_temp_upsample].clone()
+                x = F.interpolate(x.to(torch.float32), scale_factor=[2.0, 1.0, 1.0], mode=self.interpolation_mode).to(x.dtype)
+                x = x[:, :, 2*self.num_temp_upsample:]
+            else:
+                self.causal_cache = x[:, :, -self.num_temp_upsample:].clone()
+                x, _x = x[:, :, :self.num_temp_upsample], x[:, :, self.num_temp_upsample:]
+                x = F.interpolate(x.to(torch.float32), scale_factor=[2.0, 1.0, 1.0], mode=self.interpolation_mode).to(x.dtype)
+                if _x.shape[-3] > 0:
+                    _x = F.interpolate(_x.to(torch.float32), scale_factor=[2.0, 1.0, 1.0], mode=self.interpolation_mode).to(_x.dtype)
+                    x = torch.concat([x, _x], dim=2)
         x_ = self.conv(x)
         return alpha * x + (1 - alpha) * x_
         
@@ -381,6 +451,10 @@ class VidTokEncoder3D(nn.Module):
             The number of latent channels.
         double_z (`bool`, defaults to `True`): 
             Whether or not to double the z_channels.
+        spatial_ds (`List`): 
+            Spatial downsample layers.
+        tempo_ds (`List`): 
+            Temporal downsample layers.
         is_causal (`bool`, defaults to `True`): 
             Whether it is a causal module.
     """
@@ -397,6 +471,8 @@ class VidTokEncoder3D(nn.Module):
         dropout: float = 0.0,
         z_channels: int,
         double_z: bool = True,
+        spatial_ds: Optional[List] = None,
+        tempo_ds: Optional[List] = None,
         is_causal: bool = True,
         **ignore_kwargs,
     ):
@@ -415,9 +491,9 @@ class VidTokEncoder3D(nn.Module):
 
         in_ch_mult = (1,) + tuple(ch_mult)
         self.in_ch_mult = in_ch_mult
+        self.spatial_ds = list(range(0, self.num_resolutions - 1)) if spatial_ds is None else spatial_ds
+        self.tempo_ds = [self.num_resolutions - 2, self.num_resolutions - 3] if tempo_ds is None else tempo_ds
         self.down = nn.ModuleList()
-
-        self.tempo_ds = [self.num_resolutions - 2, self.num_resolutions - 3]
         self.down_temporal = nn.ModuleList()
         for i_level in range(self.num_resolutions):
             block_in = ch * in_ch_mult[i_level]
@@ -458,7 +534,7 @@ class VidTokEncoder3D(nn.Module):
             down_temporal.block = block_temporal
             down_temporal.attn = attn_temporal
 
-            if i_level != self.num_resolutions - 1:
+            if i_level in self.spatial_ds:
                 down.downsample = VidTokDownsample2D(block_in)
                 if i_level in self.tempo_ds:
                     down_temporal.downsample = VidTokDownsample3D(block_in, block_in, is_causal=self.is_causal)
@@ -519,13 +595,13 @@ class VidTokEncoder3D(nn.Module):
                     )
                     hs.append(h)
 
-                if i_level != self.num_resolutions - 1:
+                if i_level in self.spatial_ds:
                     # spatial downsample
                     htmp = rearrange(hs[-1], "b c t h w -> (b t) c h w")
                     htmp = torch.utils.checkpoint.checkpoint(create_custom_forward(self.down[i_level]), htmp)
                     htmp = rearrange(htmp, "(b t) c h w -> b c t h w", b=B, t=T)
-                    # temporal downsample
                     if i_level in self.tempo_ds:
+                        # temporal downsample
                         htmp = torch.utils.checkpoint.checkpoint(create_custom_forward(self.down_temporal[i_level]), htmp)
                     hs.append(htmp)
                     B, _, T, H, W = htmp.shape
@@ -543,13 +619,13 @@ class VidTokEncoder3D(nn.Module):
                     )
                     hs.append(h)
 
-                if i_level != self.num_resolutions - 1:
+                if i_level in self.spatial_ds:
                     # spatial downsample
                     htmp = rearrange(hs[-1], "b c t h w -> (b t) c h w")
                     htmp = self.down[i_level].downsample(htmp)
                     htmp = rearrange(htmp, "(b t) c h w -> b c t h w", b=B, t=T)
-                    # temporal downsample
                     if i_level in self.tempo_ds:
+                        # temporal downsample
                         htmp = self.down_temporal[i_level].downsample(htmp)
                     hs.append(htmp)
                     B, _, T, H, W = htmp.shape
@@ -583,6 +659,10 @@ class VidTokDecoder3D(nn.Module):
             The number of latent channels.
         out_channels (`int`):
             The number of output channels.
+        spatial_us (`List`): 
+            Spatial upsample layers.
+        tempo_us (`List`): 
+            Temporal upsample layers.
         is_causal (`bool`, defaults to `True`): 
             Whether it is a causal module.
     """
@@ -598,6 +678,8 @@ class VidTokDecoder3D(nn.Module):
         dropout: float = 0.0,
         z_channels: int,
         out_channels: int,
+        spatial_us: Optional[List] = None,
+        tempo_us: Optional[List] = None,
         is_causal: bool = True,
         **ignorekwargs,
     ):
@@ -637,8 +719,9 @@ class VidTokDecoder3D(nn.Module):
         )
 
         # upsampling
+        self.spatial_us = list(range(1, self.num_resolutions)) if spatial_us is None else spatial_us
+        self.tempo_us = [1, 2] if tempo_us is None else tempo_us
         self.up = nn.ModuleList()
-        self.tempo_us = [1, 2]
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
             attn = nn.ModuleList()
@@ -658,10 +741,11 @@ class VidTokDecoder3D(nn.Module):
             up = nn.Module()
             up.block = block
             up.attn = attn
-            if i_level != 0:
+            if i_level in self.spatial_us:
                 up.upsample = VidTokUpsample2D(block_in)
             self.up.insert(0, up)
 
+        num_temp_upsample = 1
         self.up_temporal = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
@@ -684,7 +768,8 @@ class VidTokDecoder3D(nn.Module):
             up_temporal.block = block
             up_temporal.attn = attn
             if i_level in self.tempo_us:
-                up_temporal.upsample = VidTokUpsample3D(block_in, block_in, is_causal=self.is_causal)
+                up_temporal.upsample = VidTokUpsample3D(block_in, block_in, num_temp_upsample=num_temp_upsample, is_causal=self.is_causal)
+                num_temp_upsample *= 2
 
             self.up_temporal.insert(0, up_temporal)
 
@@ -719,13 +804,13 @@ class VidTokDecoder3D(nn.Module):
                         h, self.up[i_level].block[i_block], self.up_temporal[i_level].block[i_block], temb, use_checkpoint=True
                     )
 
-                if i_level != 0:
+                if i_level in self.spatial_us:
                     # spatial upsample
                     h = rearrange(h, "b c t h w -> (b t) c h w")
                     h = torch.utils.checkpoint.checkpoint(create_custom_forward(self.up[i_level]), h)
                     h = rearrange(h, "(b t) c h w -> b c t h w", b=B, t=T)
-                    # temporal upsample
                     if i_level in self.tempo_us:
+                        # temporal upsample
                         h = torch.utils.checkpoint.checkpoint(create_custom_forward(self.up_temporal[i_level]), h)
                     B, _, T, H, W = h.shape
 
@@ -741,13 +826,13 @@ class VidTokDecoder3D(nn.Module):
                         h, self.up[i_level].block[i_block], self.up_temporal[i_level].block[i_block], temb
                     )
 
-                if i_level != 0:
+                if i_level in self.spatial_us:
                     # spatial upsample
                     h = rearrange(h, "b c t h w -> (b t) c h w")
                     h = self.up[i_level].upsample(h)
                     h = rearrange(h, "(b t) c h w -> b c t h w", b=B, t=T)
-                    # temporal upsample
                     if i_level in self.tempo_us:
+                        # temporal upsample
                         h = self.up_temporal[i_level].upsample(h)
                     B, _, T, H, W = h.shape
 
@@ -781,20 +866,22 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             Whether or not to double the z_channels.
         num_res_blocks (`int`, defaults to 2):
             The number of resblocks.
+        spatial_ds (`List`): 
+            Spatial downsample layers.
+        spatial_us (`List`): 
+            Spatial upsample layers.
+        tempo_ds (`List`): 
+            Temporal downsample layers.
+        tempo_us (`List`): 
+            Temporal upsample layers.
         dropout (`float`, defaults to 0.0):
             Dropout rate.
-        temporal_compression_ratio (`int`, defaults to 4):
-            The compression ratio in the time domain.
         regularizer (`str`, defaults to `"kl"`):
             The regularizer type - "kl" for continuous cases and "fsq" for discrete cases.
         codebook_size (`int`, defaults to 262144):
             The codebook size used only in discrete cases.
         is_causal (`bool`, defaults to `True`): 
             Whether it is a causal module.
-        # sample_height (`int`, defaults to 256): 
-        #     Sample input height.
-        # sample_width (`int`, defaults to 256): 
-        #     Sample input width.
     """
 
     _supports_gradient_checkpointing = True
@@ -809,13 +896,14 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         z_channels: int = 4,
         double_z: bool = True,
         num_res_blocks: int = 2,
+        spatial_ds: Optional[List] = None,
+        spatial_us: Optional[List] = None,
+        tempo_ds: Optional[List] = None,
+        tempo_us: Optional[List] = None,
         dropout: float = 0.0,
-        temporal_compression_ratio: int = 4,
         regularizer: str = "kl",
         codebook_size: int = 262144,
         is_causal: bool = True,
-        # sample_height: int = 256,
-        # sample_width: int = 256,
     ):
         super().__init__()
         self.is_causal = is_causal
@@ -828,6 +916,8 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             dropout=dropout,
             z_channels=z_channels,
             double_z=double_z,
+            spatial_ds=spatial_ds,
+            tempo_ds=tempo_ds,
             is_causal=self.is_causal,
         )
         self.decoder = VidTokDecoder3D(
@@ -837,9 +927,11 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             dropout=dropout,
             z_channels=z_channels,
             out_channels=out_channels,
+            spatial_us=spatial_us,
+            tempo_us=tempo_us,
             is_causal=self.is_causal,
         )
-        self.temporal_compression_ratio = temporal_compression_ratio
+        self.temporal_compression_ratio = 2 ** len(self.encoder.tempo_ds)
 
         self.regularizer = regularizer
         assert self.regularizer in ["kl", "fsq"], f"Invalid regularizer: {self.regtype}. Only support 'kl' and 'fsq'."
@@ -856,13 +948,10 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.num_latent_frames_batch_size = self.num_sample_frames_batch_size // self.temporal_compression_ratio
 
         # We make the minimum height and width of sample for tiling half that of the generally supported
-        # self.tile_sample_min_height = sample_height // 2
-        # self.tile_sample_min_width = sample_width // 2
         self.tile_sample_min_height = 256
         self.tile_sample_min_width = 256
-        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** (len(self.config.ch_mult) - 1)))
-        self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** (len(self.config.ch_mult) - 1)))
-        
+        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** len(self.encoder.spatial_ds)))
+        self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** len(self.encoder.spatial_ds)))
         self.tile_overlap_factor_height = 0.0  # 1 / 8
         self.tile_overlap_factor_width = 0.0  # 1 / 8
     
@@ -908,8 +997,8 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.use_tiling = True
         self.tile_sample_min_height = tile_sample_min_height or self.tile_sample_min_height
         self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
-        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** (len(self.config.ch_mult) - 1)))
-        self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** (len(self.config.ch_mult) - 1)))
+        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** len(self.encoder.spatial_ds)))
+        self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** len(self.encoder.spatial_ds)))
         self.tile_overlap_factor_height = tile_overlap_factor_height or self.tile_overlap_factor_height
         self.tile_overlap_factor_width = tile_overlap_factor_width or self.tile_overlap_factor_width
 
@@ -935,16 +1024,15 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.use_slicing = False
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        num_frames, height, width = x.shape[-3:]
-        # print(width, height, self.tile_sample_min_width, self.tile_sample_min_height)
-        # exit()
-        if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height or num_frames > self.num_sample_frames_batch_size):
+        self._empty_causal_cached(self.encoder)
+        self._set_first_chunk(True)
+        
+        if self.use_tiling:
             return self.tiled_encode(x)
-
         return self.encoder(x)
 
     @apply_forward_hook
-    def encode(self, x: torch.Tensor) -> Union[AutoencoderKLOutput, torch.Tensor]:
+    def encode(self, x: torch.Tensor) -> Union[AutoencoderKLOutput, Tuple[torch.Tensor]]:
         r"""
         Encode a batch of images into latents.
 
@@ -952,9 +1040,9 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             x (`torch.Tensor`): Input batch of images.
 
         Returns:
-            `AutoencoderKLOutput` or `torch.Tensor`:
+            `AutoencoderKLOutput` or `Tuple[torch.Tensor]`:
                 The latent representations of the encoded videos. If the regularizer is `kl`, an `AutoencoderKLOutput` 
-                is returned, otherwise a plain `torch.Tensor` is returned.
+                is returned, otherwise a tuple of `torch.Tensor` is returned.
         """
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
@@ -966,33 +1054,38 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             posterior = DiagonalGaussianDistribution(z)
             return AutoencoderKLOutput(latent_dist=posterior)
         else:
-            quant_z = self.regularization(z)[0]
-            return quant_z
+            quant_z, indices = self.regularization(z)
+            return quant_z, indices
     
-    def _decode(self, z: torch.Tensor) -> torch.Tensor:
-        height, width = z.shape[-2:]
-        if self.use_tiling and (width > self.tile_latent_min_width or height > self.tile_latent_min_height):
+    def _decode(self, z: torch.Tensor, decode_from_indices: bool = False) -> torch.Tensor:
+        self._empty_causal_cached(self.decoder)
+        self._set_first_chunk(True)
+        
+        if decode_from_indices:
+            z = self.tile_indices_to_latent(z) if self.use_tiling else self.indices_to_latent(z)
+        if self.use_tiling:
             return self.tiled_decode(z)
-
         return self.decoder(z)
 
     @apply_forward_hook
-    def decode(self, z: torch.Tensor) -> DecoderOutput:
+    def decode(self, z: torch.Tensor, decode_from_indices: bool = False) -> torch.Tensor:
         r"""
         Decode a batch of images from latents.
 
         Args:
             z (`torch.Tensor`): Input batch of latent vectors.
-
+            decode_from_indices (`bool`): If decode from indices or decode from latent code.
         Returns:
-            `DecoderOutput`: The decoded images.
+            `torch.Tensor`: The decoded images.
         """
         if self.use_slicing and z.shape[0] > 1:
-            decoded_slices = [self._decode(z_slice) for z_slice in z.split(1)]
+            decoded_slices = [self._decode(z_slice, decode_from_indices=decode_from_indices) for z_slice in z.split(1)]
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(z)
-        return DecoderOutput(sample=decoded)
+            decoded = self._decode(z, decode_from_indices=decode_from_indices)
+        if self.is_causal:
+            decoded = decoded[:, :, self.temporal_compression_ratio - 1 :, :, :]
+        return decoded
     
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[3], b.shape[3], blend_extent)
@@ -1009,8 +1102,42 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 x / blend_extent
             )
         return b
+    
+    def build_chunk_start_end(self, t, decoder_mode=False):
+        if self.is_causal:
+            start_end = [[0, self.temporal_compression_ratio]] if not decoder_mode else [[0, 1]]
+            start = start_end[0][-1]
+        else:
+            start_end, start = [], 0
+        end = start
+        while True:
+            if start >= t:
+                break
+            end = min(t, end + (self.num_latent_frames_batch_size if decoder_mode else self.num_sample_frames_batch_size))
+            start_end.append([start, end])
+            start = end
+        if len(start_end) > (2 if self.is_causal else 1):
+            if start_end[-1][1] - start_end[-1][0] < (self.num_latent_frames_batch_size if decoder_mode else self.num_sample_frames_batch_size):
+                start_end[-2] = [start_end[-2][0], start_end[-1][1]]
+                start_end = start_end[:-1]
+        return start_end
+    
+    def _set_first_chunk(self, is_first_chunk=True):
+        for module in self.modules():
+            if hasattr(module, 'is_first_chunk'):
+                module.is_first_chunk = is_first_chunk
+    
+    def _empty_causal_cached(self, parent):
+        for name, module in parent.named_modules():
+            if hasattr(module, 'causal_cache'):
+                module.causal_cache = None
+                
+    def _set_cache_offset(self, modules, cache_offset=0):
+        for module in modules:
+            for submodule in module.modules():
+                if hasattr(submodule, 'cache_offset'):
+                    submodule.cache_offset = cache_offset
 
-    # TODO
     def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
         r"""Encode a batch of images using a tiled encoder.
 
@@ -1034,36 +1161,27 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         blend_extent_width = int(self.tile_latent_min_width * self.tile_overlap_factor_width)
         row_limit_height = self.tile_latent_min_height - blend_extent_height
         row_limit_width = self.tile_latent_min_width - blend_extent_width
-        frame_batch_size = self.num_sample_frames_batch_size
         
-        # print(overlap_height, overlap_width, blend_extent_height, row_limit_height, row_limit_width)    
-        # exit()
-
         # Split x into overlapping tiles and encode them separately.
         # The tiles have an overlap to avoid seams between tiles.
         rows = []
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
-                num_batches = max(num_frames // frame_batch_size, 1)
+                start_end = self.build_chunk_start_end(num_frames)
                 time = []
-                for k in range(num_batches):
-                    remaining_frames = num_frames % frame_batch_size
-                    start_frame = frame_batch_size * k + (0 if k == 0 else remaining_frames)
-                    end_frame = frame_batch_size * (k + 1) + remaining_frames
+                for idx, (start_frame, end_frame) in enumerate(start_end):
+                    self._set_first_chunk(idx == 0)
                     tile = x[
-                        :,
-                        :,
-                        start_frame:end_frame,
+                        :, 
+                        :, 
+                        start_frame:end_frame, 
                         i : i + self.tile_sample_min_height,
                         j : j + self.tile_sample_min_width,
                     ]
                     tile = self.encoder(tile)
                     time.append(tile)
                 row.append(torch.cat(time, dim=2))
-                # tile = x[:, :, :, i : i + self.tile_sample_min_height, j : j + self.tile_sample_min_width]
-                # tile = self.encoder(tile)
-                # row.append(tile)
             rows.append(row)
 
         result_rows = []
@@ -1076,12 +1194,47 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     tile = self.blend_v(rows[i - 1][j], tile, blend_extent_height)
                 if j > 0:
                     tile = self.blend_h(row[j - 1], tile, blend_extent_width)
-                # print(i, j, tile[:, :, :, :row_limit_height, :row_limit_width].shape)
                 result_row.append(tile[:, :, :, :row_limit_height, :row_limit_width])
             result_rows.append(torch.cat(result_row, dim=4))
-
         enc = torch.cat(result_rows, dim=3)
         return enc
+    
+    def indices_to_latent(self, token_indices: torch.Tensor) -> torch.Tensor:
+        r"""
+        Transform indices to latent code.
+
+        Args:
+            token_indices (`torch.Tensor`): Token indices.
+
+        Returns:
+            `torch.Tensor`: Latent code corresponding to the input token indices.
+        """
+        token_indices = rearrange(token_indices, "... -> ... 1")
+        token_indices, ps = pack([token_indices], "b * d")
+        codes = self.regularization.indices_to_codes(token_indices)
+        codes = rearrange(codes, "b d n c -> b n (c d)")
+        z = self.regularization.project_out(codes)
+        z = unpack(z, ps, "b * d")[0]
+        z = rearrange(z, "b ... d -> b d ...")
+        return z
+    
+    def tile_indices_to_latent(self, token_indices: torch.Tensor) -> torch.Tensor:
+        r"""
+        Transform indices to latent code with tiling inference.
+
+        Args:
+            token_indices (`torch.Tensor`): Token indices.
+
+        Returns:
+            `torch.Tensor`: Latent code corresponding to the input token indices.
+        """
+        num_frames = token_indices.shape[1]
+        start_end = self.build_chunk_start_end(num_frames, decoder_mode=True)
+        result_z = []
+        for (start, end) in start_end:
+            chunk_z = self.indices_to_latent(token_indices[:, start:end, :, :])
+            result_z.append(chunk_z.clone())
+        return torch.cat(result_z, dim=2)
 
     def tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
         r"""
@@ -1101,38 +1254,35 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         blend_extent_width = int(self.tile_sample_min_width * self.tile_overlap_factor_width)
         row_limit_height = self.tile_sample_min_height - blend_extent_height
         row_limit_width = self.tile_sample_min_width - blend_extent_width
-        frame_batch_size = self.num_latent_frames_batch_size
         
-        # print(height, overlap_height, blend_extent_height, row_limit_height)
-        # exit()
-
         # Split z into overlapping tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
         rows = []
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
-                num_batches = max(num_frames // frame_batch_size, 1)
-                time = []
-                for k in range(num_batches):
-                    remaining_frames = num_frames % frame_batch_size
-                    start_frame = frame_batch_size * k + (0 if k == 0 else remaining_frames)
-                    end_frame = frame_batch_size * (k + 1) + remaining_frames
-                    tile = z[
-                        :,
-                        :,
-                        start_frame:end_frame,
-                        i : i + self.tile_latent_min_height,
-                        j : j + self.tile_latent_min_width,
-                    ]
-                    tile = self.decoder(tile)
-                    time.append(tile)
+                if self.is_causal:  # TODO: support more settings
+                    assert self.temporal_compression_ratio == 4, "Only support 4x temporal downsampling now."
+                    self._set_cache_offset([self.decoder], 1)
+                    self._set_cache_offset([self.decoder.up_temporal[1], self.decoder.up_temporal[2].upsample], 2)
+                    self._set_cache_offset([self.decoder.up_temporal[0], self.decoder.up_temporal[1].upsample, self.decoder.conv_out], 4)
                     
-                # tile = z[:, :, :, i : i + self.tile_latent_min_height, j : j + self.tile_latent_min_width]
-                # tile = self.decoder(tile)
-                # row.append(tile)
+                start_end = self.build_chunk_start_end(num_frames, decoder_mode=True)
+                time = []
+                for idx, (start_frame, end_frame) in enumerate(start_end):
+                    self._set_first_chunk(idx == 0)
+                    tile = z[
+                        :, 
+                        :, 
+                        start_frame : (end_frame + 1 if self.is_causal and end_frame + 1 <= num_frames else end_frame), 
+                        i : i + self.tile_latent_min_height, 
+                        j : j + self.tile_latent_min_width,
+                    ] 
+                    tile = self.decoder(tile)
+                    if self.is_causal and end_frame + 1 <= num_frames:
+                        tile = tile[:, :, : -self.temporal_compression_ratio]
+                    time.append(tile)
                 row.append(torch.cat(time, dim=2))
-                
             rows.append(row)
 
         result_rows = []
@@ -1154,18 +1304,22 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     def forward(
         self,
         sample: torch.Tensor,
-        sample_posterior: bool = False,
+        sample_posterior: bool = True,
+        encoder_mode: bool = False,
         return_dict: bool = True,
         generator: Optional[torch.Generator] = None,
     ) -> Union[torch.Tensor, DecoderOutput]:
         r"""The forward method of the `AutoencoderVidTok` class."""
         x = sample
-
-        if x.shape[2] % self.temporal_compression_ratio != 0:
-            time_padding = self.temporal_compression_ratio - x.shape[2] % self.temporal_compression_ratio
-            x = self.pad_at_dim(x, (time_padding, 0), dim=2, pad_mode="replicate")
+        res = 1 if self.is_causal else 0
+        if x.shape[2] % self.temporal_compression_ratio != res:
+            time_padding = self.temporal_compression_ratio - x.shape[2] % self.temporal_compression_ratio + res
+            x = self.pad_at_dim(x, (0, time_padding), dim=2, pad_mode="replicate")
         else:
             time_padding = 0
+        
+        if self.is_causal:
+            x = self.pad_at_dim(x, (self.temporal_compression_ratio - 1, 0), dim=2, pad_mode="replicate")
 
         if self.regularizer == "kl":
             posterior = self.encode(x).latent_dist
@@ -1173,12 +1327,17 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 z = posterior.sample(generator=generator)
             else:
                 z = posterior.mode()
+            if encoder_mode:
+                return z
         else:
-            z = self.encode(x)
-
-        dec = self.decode(z).sample
-        dec = dec[:, :, time_padding:, :, :]
+            z, indices = self.encode(x)
+            if encoder_mode:
+                return z, indices
+        
+        dec = self.decode(z)
+        if time_padding != 0:
+            dec = dec[:, :, : -time_padding, :, :]
 
         if not return_dict:
-            return (dec,)
+            return dec
         return DecoderOutput(sample=dec)

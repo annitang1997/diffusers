@@ -33,23 +33,22 @@ class AutoencoderVidTokTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCas
 
     def get_autoencoder_vidtok_config(self):
         return {
-            "is_causal": True,
+            "is_causal": False,
             "in_channels": 3,
             "out_channels": 3,
             "ch": 128,
-            "ch_mult": [1, 2, 4, 4],
-            "z_channels": 4,
-            "double_z": True,
+            "ch_mult": [1, 2, 4, 4, 4],
+            "z_channels": 6,
+            "double_z": False,
             "num_res_blocks": 2, 
-            "temporal_compression_ratio": 4,
-            "regularizer": 'kl',  # fsq
+            "regularizer": 'fsq',
             "codebook_size": 262144,
         }
 
     @property
     def dummy_input(self):
         batch_size = 4
-        num_frames = 17
+        num_frames = 16
         num_channels = 3
         sizes = (32, 32)
 
@@ -59,11 +58,11 @@ class AutoencoderVidTokTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCas
 
     @property
     def input_shape(self):
-        return (3, 17, 32, 32)
+        return (3, 16, 32, 32)
 
     @property
     def output_shape(self):
-        return (3, 17, 32, 32)
+        return (3, 16, 32, 32)
 
     def prepare_init_args_and_inputs_for_common(self):
         init_dict = self.get_autoencoder_vidtok_config()
