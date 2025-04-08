@@ -15,6 +15,7 @@
 
 import numbers
 from typing import Dict, Optional, Tuple
+from einops import rearrange
 
 import torch
 import torch.nn as nn
@@ -468,6 +469,28 @@ class CogVideoXLayerNormZero(nn.Module):
         hidden_states = self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
         encoder_hidden_states = self.norm(encoder_hidden_states) * (1 + enc_scale)[:, None, :] + enc_shift[:, None, :]
         return hidden_states, encoder_hidden_states, gate[:, None, :], enc_gate[:, None, :]
+
+
+class VidTokLayerNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+
+        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 5:
+            x = rearrange(x, "b c t h w -> b t h w c")
+            x = self.norm(x)
+            x = rearrange(x, "b t h w c -> b c t h w")
+        elif x.dim() == 4:
+            x = rearrange(x, "b c h w -> b h w c")
+            x = self.norm(x)
+            x = rearrange(x, "b h w c -> b c h w")
+        else:
+            x = rearrange(x, "b c s -> b s c")
+            x = self.norm(x)
+            x = rearrange(x, "b s c -> b c s")
+        return x
 
 
 if is_torch_version(">=", "2.1.0"):
