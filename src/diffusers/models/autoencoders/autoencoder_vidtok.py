@@ -964,10 +964,6 @@ class AutoencoderVidTok(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             return F.pad(t, (*zeros, *pad), value=value)
         return F.pad(t, (*zeros, *pad), mode=pad_mode)
     
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, (VidTokEncoder3D, VidTokDecoder3D)):
-            module.gradient_checkpointing = value
-    
     def enable_tiling(
         self,
         tile_sample_min_height: Optional[int] = None,
