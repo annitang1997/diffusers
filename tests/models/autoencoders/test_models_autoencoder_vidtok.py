@@ -40,8 +40,8 @@ class AutoencoderVidTokTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCas
             "ch_mult": [1, 2, 4, 4, 4],
             "z_channels": 6,
             "double_z": False,
-            "num_res_blocks": 2, 
-            "regularizer": 'fsq',
+            "num_res_blocks": 2,
+            "regularizer": "fsq",
             "codebook_size": 262144,
         }
 

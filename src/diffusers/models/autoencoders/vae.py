@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Any
-from einops import rearrange, pack, unpack
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+from einops import pack, rearrange, unpack
 
 from ...utils import BaseOutput
 from ...utils.torch_utils import randn_tensor
@@ -691,12 +691,12 @@ class VectorQuantizer(nn.Module):
 
 class FSQRegularizer(nn.Module):
     r"""
-    Finite Scalar Quantization: VQ-VAE Made Simple - https://arxiv.org/abs/2309.15505
-    Code adapted from https://github.com/lucidrains/vector-quantize-pytorch/blob/master/vector_quantize_pytorch/finite_scalar_quantization.py
-    
+    Finite Scalar Quantization: VQ-VAE Made Simple - https://arxiv.org/abs/2309.15505 Code adapted from
+    https://github.com/lucidrains/vector-quantize-pytorch/blob/master/vector_quantize_pytorch/finite_scalar_quantization.py
+
     Args:
         levels (`List[int]`):
-            A list of quantization levels. 
+            A list of quantization levels.
         dim (`int`, *Optional*, defaults to `None`):
             The dimension of latent codes.
         num_codebooks (`int`, defaults to 1):
@@ -704,13 +704,14 @@ class FSQRegularizer(nn.Module):
         keep_num_codebooks_dim (`bool`, *Optional*, defaults to `None`):
             whether to keep the number of codebook dim.
     """
+
     def __init__(
         self,
         levels: List[int],
         dim: Optional[int] = None,
         num_codebooks: int = 1,
         keep_num_codebooks_dim: Optional[bool] = None,
-    ): 
+    ):
         super().__init__()
 
         _levels = torch.tensor(levels, dtype=torch.int32)
@@ -771,7 +772,7 @@ class FSQRegularizer(nn.Module):
     def quantize(self, z: torch.Tensor) -> torch.Tensor:
         r"""Quantizes z, returns quantized zhat, same shape as z."""
         quantized = self.round_ste(self.bound(z))
-        half_width = self._levels // 2 
+        half_width = self._levels // 2
         return quantized / half_width
 
     def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:
@@ -805,11 +806,8 @@ class FSQRegularizer(nn.Module):
     @torch.cuda.amp.autocast(enabled=False)
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        einstein notation
-        b - batch
-        n - sequence (or flattened spatial dimensions)
-        d - feature dimension
-        c - number of codebook dim
+        einstein notation b - batch n - sequence (or flattened spatial dimensions) d - feature dimension c - number of
+        codebook dim
         """
         is_img_or_video = z.ndim >= 4
         if is_img_or_video:
@@ -824,7 +822,6 @@ class FSQRegularizer(nn.Module):
         with torch.autocast("cuda", enabled=False):
             orig_dtype = z.dtype
             z = z.float()
-            original_input = z
             codes = self.quantize(z)
             indices = self.codes_to_indices(codes)
             codes = codes.type(orig_dtype)
@@ -842,8 +839,8 @@ class FSQRegularizer(nn.Module):
             indices = rearrange(indices, "... 1 -> ...")
 
         return out, indices
-     
-     
+
+
 class DiagonalGaussianDistribution(object):
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
         self.parameters = parameters

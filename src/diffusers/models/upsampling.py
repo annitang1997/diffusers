@@ -360,7 +360,7 @@ class VidTokUpsample2D(nn.Module):
     r"""A 2D upsampling layer used in [VidTok](https://arxiv.org/pdf/2412.13061) by MSRA & Shanghai Jiao Tong University
 
     Args:
-        in_channels (`int`): 
+        in_channels (`int`):
             Number of channels of the input feature.
     """
 
@@ -374,7 +374,7 @@ class VidTokUpsample2D(nn.Module):
         x = F.interpolate(x.to(torch.float32), scale_factor=2.0, mode="nearest").to(x.dtype)
         x = self.conv(x)
         return x
-     
+
 
 class CogVideoXUpsample3D(nn.Module):
     r"""

@@ -289,7 +289,7 @@ class VidTokDownsample2D(nn.Module):
     r"""A 2D downsampling layer used in [VidTok](https://arxiv.org/pdf/2412.13061) by MSRA & Shanghai Jiao Tong University
 
     Args:
-        in_channels (`int`): 
+        in_channels (`int`):
             Number of channels of the input feature.
     """
 
@@ -304,7 +304,7 @@ class VidTokDownsample2D(nn.Module):
         x = F.pad(x, pad, mode="constant", value=0)
         x = self.conv(x)
         return x
-     
+
 
 class CogVideoXDownsample3D(nn.Module):
     # Todo: Wait for paper relase.
